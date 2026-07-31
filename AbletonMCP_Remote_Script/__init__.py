@@ -226,6 +226,11 @@ class AbletonMCP(ControlSurface):
             elif command_type == "get_track_info":
                 track_index = params.get("track_index", 0)
                 response["result"] = self._get_track_info(track_index)
+            elif command_type == "export_song_state":
+                response["result"] = self._export_song_state(
+                    include_notes=params.get("include_notes", True),
+                    include_arrangement=params.get("include_arrangement", True),
+                    track_index=params.get("track_index", None))
             # Commands that modify Live's state should be scheduled on the main thread
             elif command_type in ["create_midi_track", "set_track_name",
                                  "create_clip", "create_audio_clip", "add_notes_to_clip", "set_clip_name",
@@ -757,6 +762,145 @@ class AbletonMCP(ControlSurface):
         except Exception as e:
             self.log_message("Error setting current song time: " + str(e))
             raise
+
+    def _export_song_state(self, include_notes=True, include_arrangement=True,
+                           track_index=None):
+        """Return the structural state of the whole song in one response.
+
+        Live's API offers no way to save a Set from a Remote Script, so this is
+        the next best thing: everything needed to rebuild a song by script —
+        tempo, tracks, the devices on them, every Session clip with its notes,
+        and the Arrangement layout. Unlike a .als (gzipped XML) the result is
+        diffable, which makes it useful to keep under version control.
+
+        Deliberately NOT covered, because the API cannot set these back:
+        device parameters, automation envelopes and clip envelopes. A restored
+        song therefore has the right notes, structure and instruments, but
+        every device sits at its preset defaults.
+
+        Parameters:
+          include_notes       include MIDI notes per clip (default True)
+          include_arrangement include the Arrangement timeline (default True)
+          track_index         limit the export to a single track (default: all)
+        """
+        try:
+            song = self._song
+
+            if track_index is None:
+                indices = range(len(song.tracks))
+            else:
+                if track_index < 0 or track_index >= len(song.tracks):
+                    raise IndexError("Track index out of range")
+                indices = [track_index]
+
+            tracks = []
+            for idx in indices:
+                track = song.tracks[idx]
+
+                devices = []
+                for device in track.devices:
+                    devices.append({
+                        "name": device.name,
+                        "class_name": device.class_name
+                    })
+
+                session_clips = []
+                for slot_index, clip_slot in enumerate(track.clip_slots):
+                    if not clip_slot.has_clip:
+                        continue
+                    clip = clip_slot.clip
+                    entry = {
+                        "slot": slot_index,
+                        "name": clip.name,
+                        "length": clip.length,
+                        "is_midi_clip": clip.is_midi_clip,
+                        "looping": clip.looping
+                    }
+                    if include_notes and clip.is_midi_clip:
+                        entry["notes"] = self._clip_notes(clip)
+                    session_clips.append(entry)
+
+                entry = {
+                    "index": idx,
+                    "name": track.name,
+                    # Live has no is_midi_track/is_audio_track — the input
+                    # capabilities are what _get_track_info reports as well.
+                    "is_midi_track": track.has_midi_input,
+                    "is_audio_track": track.has_audio_input,
+                    "devices": devices,
+                    "mixer": {
+                        "volume": track.mixer_device.volume.value,
+                        "panning": track.mixer_device.panning.value,
+                        "mute": track.mute,
+                        "solo": track.solo
+                    },
+                    "session_clips": session_clips
+                }
+
+                if include_arrangement:
+                    arrangement = []
+                    # track.arrangement_clips is available in Live 11 / 12
+                    for clip in track.arrangement_clips:
+                        clip_entry = {
+                            "name": clip.name,
+                            "start_time": clip.start_time,
+                            "end_time": clip.end_time,
+                            "length": clip.length,
+                            "is_midi_clip": clip.is_midi_clip
+                        }
+                        if include_notes and clip.is_midi_clip:
+                            clip_entry["notes"] = self._clip_notes(clip)
+                        arrangement.append(clip_entry)
+                    entry["arrangement_clips"] = arrangement
+
+                tracks.append(entry)
+
+            state = {
+                "tempo": song.tempo,
+                "signature_numerator": song.signature_numerator,
+                "signature_denominator": song.signature_denominator,
+                "scene_count": len(song.scenes),
+                "scene_names": [scene.name for scene in song.scenes],
+                "track_count": len(song.tracks),
+                "tracks": tracks
+            }
+
+            # Where Live saved this Set — empty for an unsaved one. Reading it
+            # is the only file-level information the API exposes.
+            try:
+                state["file_path"] = song.file_path
+            except Exception:
+                state["file_path"] = None
+
+            return state
+        except Exception as e:
+            self.log_message("Error exporting song state: " + str(e))
+            self.log_message(traceback.format_exc())
+            raise
+
+    def _clip_notes(self, clip):
+        """Read a MIDI clip's notes in the same shape add_notes_to_clip expects.
+
+        clip.get_notes() is the counterpart of the clip.set_notes() used by
+        _add_notes_to_clip, so an exported clip can be fed straight back in.
+        """
+        notes = []
+        try:
+            raw = clip.get_notes(0.0, 0, clip.length, 128)
+        except Exception as e:
+            self.log_message("Could not read notes from clip '" +
+                             str(clip.name) + "': " + str(e))
+            return notes
+        for pitch, start_time, duration, velocity, mute in raw:
+            notes.append({
+                "pitch": pitch,
+                "start_time": start_time,
+                "duration": duration,
+                "velocity": velocity,
+                "mute": mute
+            })
+        notes.sort(key=lambda n: (n["start_time"], n["pitch"]))
+        return notes
 
     def _get_arrangement_clips(self, track_index):
         """Return all clips placed in the Arrangement timeline for a track.

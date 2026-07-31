@@ -793,6 +793,46 @@ def get_arrangement_clips(ctx: Context, track_index: int, user_prompt: str = "")
 
 
 @mcp.tool()
+@telemetry_tool("export_song_state")
+def export_song_state(ctx: Context, include_notes: bool = True,
+                      include_arrangement: bool = True,
+                      track_index: int = -1, user_prompt: str = "") -> str:
+    """
+    Export the structural state of the whole song as JSON.
+
+    Live's API offers no way to save a Set from a Remote Script, so this is the
+    next best thing: tempo, tracks, the devices on them, every Session clip with
+    its notes, and the Arrangement layout — everything needed to rebuild the
+    song by script. Unlike a .als (gzipped XML) the result is diffable, which
+    makes it suitable for version control.
+
+    Not covered, because the API cannot set them back: device parameters,
+    automation and clip envelopes. A restored song has the right notes,
+    structure and instruments, but devices sit at their preset defaults.
+
+    Parameters:
+    - include_notes: include MIDI notes per clip (default True); set False for a
+      compact structural overview of a large set
+    - include_arrangement: include the Arrangement timeline (default True)
+    - track_index: limit the export to one track; -1 (default) exports all
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        ableton = get_ableton_connection()
+        params = {
+            "include_notes": include_notes,
+            "include_arrangement": include_arrangement,
+        }
+        if track_index >= 0:
+            params["track_index"] = track_index
+        result = ableton.send_command("export_song_state", params)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error exporting song state: {str(e)}")
+        return f"Error exporting song state: {str(e)}"
+
+
+@mcp.tool()
 @rich_telemetry_tool("duplicate_to_arrangement")
 def duplicate_to_arrangement(
     ctx: Context,
